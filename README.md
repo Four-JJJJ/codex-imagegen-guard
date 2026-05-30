@@ -65,6 +65,34 @@ localhost DIRECT
 
 不同代理软件写法不同，核心目标是：`127.0.0.1:11435` 必须走 DIRECT。
 
+## 与 CC Switch 一起使用
+
+可以兼容。推荐链路是：
+
+```txt
+Codex Desktop -> codex-imagegen-guard:11435 -> CC Switch:15721 -> 当前 Provider
+```
+
+推荐安装顺序：
+
+1. 先在 CC Switch 里打开 Proxy Service。
+2. 如果要让 CC Switch 管理 Codex Provider，再打开 Codex Routing，让 Codex 暂时指到 `http://127.0.0.1:15721/v1`。
+3. 最后安装或重装 `codex-imagegen-guard`。安装脚本会自动识别 `127.0.0.1:15721`，并把它作为 guard 的上游。
+
+如果 CC Switch 后续又把 Codex 配置改回自己的路由，运行：
+
+```zsh
+~/.codex/imagegen-guard/repair.sh
+```
+
+查看当前链路状态：
+
+```zsh
+~/.codex/imagegen-guard/doctor.sh
+```
+
+`doctor.sh` 的 `status=ok` 表示 Codex 正在经过 guard；`status=bypassed-cc-switch` 表示 CC Switch 又接管了 Codex 入口，需要运行 `repair.sh`。
+
 ## 高级配置
 
 安装时可通过环境变量覆盖默认行为：
@@ -72,6 +100,7 @@ localhost DIRECT
 ```zsh
 CODEX_SANITIZER_PROVIDER=Codex \
 CODEX_SANITIZER_UPSTREAM=https://api.example.com/v1 \
+CODEX_SANITIZER_CCSWITCH_URL=http://127.0.0.1:15721/v1 \
 CODEX_SANITIZER_UPSTREAM_PROXY_MODE=system \
 zsh install.sh
 ```
@@ -80,6 +109,7 @@ zsh install.sh
 
 - `CODEX_SANITIZER_PROVIDER`：指定要修改的 Codex provider，默认读取当前 `model_provider`。
 - `CODEX_SANITIZER_UPSTREAM`：指定真实上游 `base_url`。
+- `CODEX_SANITIZER_CCSWITCH_URL`：指定 CC Switch 本机路由地址，默认 `http://127.0.0.1:15721/v1`。
 - `CODEX_SANITIZER_NO_PROXY`：覆盖本服务使用的 `NO_PROXY`。
 - `CODEX_SANITIZER_UPSTREAM_PROXY_MODE`：`system` 或 `direct`。默认 `system`，表示上游继续走系统代理。
 
@@ -151,6 +181,34 @@ localhost DIRECT
 ```
 
 The goal is simple: `127.0.0.1:11435` must not be intercepted by your proxy app.
+
+## With CC Switch
+
+This project can work with CC Switch. The recommended chain is:
+
+```txt
+Codex Desktop -> codex-imagegen-guard:11435 -> CC Switch:15721 -> active provider
+```
+
+Recommended setup:
+
+1. Enable Proxy Service in CC Switch first.
+2. If you want CC Switch to manage Codex providers, enable Codex Routing so Codex temporarily points to `http://127.0.0.1:15721/v1`.
+3. Install or reinstall `codex-imagegen-guard` last. The installer detects the CC Switch route and stores it as the guard upstream.
+
+If CC Switch later rewrites Codex back to its own route, run:
+
+```zsh
+~/.codex/imagegen-guard/repair.sh
+```
+
+Check the current chain:
+
+```zsh
+~/.codex/imagegen-guard/doctor.sh
+```
+
+`status=ok` means Codex is going through the guard. `status=bypassed-cc-switch` means CC Switch took over the Codex entry again, so run `repair.sh`.
 
 ## Uninstall
 

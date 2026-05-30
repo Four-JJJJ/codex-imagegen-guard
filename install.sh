@@ -12,6 +12,7 @@ LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 PLIST_PATH="$LAUNCH_AGENT_DIR/$LABEL.plist"
 DEFAULT_PORT=11435
 MAX_PORT=11445
+DEFAULT_CCSWITCH_URL="http://127.0.0.1:15721/v1"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 
 say() {
@@ -91,6 +92,56 @@ raise SystemExit(1)
 PY
 }
 
+read_env_key() {
+  python3 - "$1" "$2" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+target = sys.argv[2]
+if not path.exists():
+    raise SystemExit(1)
+
+for line in path.read_text().splitlines():
+    if not line.startswith(f"{target}="):
+        continue
+    try:
+        parsed = shlex.split(line.split("=", 1)[1], posix=True)
+        print(parsed[0] if parsed else "")
+    except ValueError:
+        print(line.split("=", 1)[1].strip("'\""))
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+normalize_base_url() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+raw = sys.argv[1].strip().rstrip("/")
+parsed = urllib.parse.urlparse(raw)
+host = parsed.hostname or ""
+if host == "localhost":
+    host = "127.0.0.1"
+port = f":{parsed.port}" if parsed.port else ""
+path = (parsed.path or "").rstrip("/")
+print(urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", "")))
+PY
+}
+
+url_port() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+parsed = urllib.parse.urlparse(sys.argv[1].strip())
+print(parsed.port or "")
+PY
+}
+
 read_active_provider() {
   python3 - "$1" <<'PY'
 import re
@@ -109,6 +160,10 @@ PY
 
 provider_name="${CODEX_SANITIZER_PROVIDER:-$(read_active_provider "$CONFIG_FILE")}"
 [[ -n "$provider_name" ]] || fail "could not determine active Codex provider"
+ccswitch_base="${CODEX_SANITIZER_CCSWITCH_URL:-$DEFAULT_CCSWITCH_URL}"
+ccswitch_base="${ccswitch_base%/}"
+normalized_ccswitch_base="$(normalize_base_url "$ccswitch_base")"
+ccswitch_port="$(url_port "$ccswitch_base")"
 
 launch_no_proxy="$(launchctl getenv NO_PROXY 2>/dev/null || true)"
 no_proxy_value="${CODEX_SANITIZER_NO_PROXY:-$(merge_no_proxy "127.0.0.1,localhost,::1" "${NO_PROXY:-}" "${no_proxy:-}" "$launch_no_proxy")}"
@@ -125,14 +180,29 @@ is_local_base() {
   [[ "$1" == http://127.0.0.1:* || "$1" == http://localhost:* ]]
 }
 
-read_existing_upstream() {
-  if [[ -f "$INSTALL_ROOT/config.env" ]]; then
-    read_upstream_from_env "$INSTALL_ROOT/config.env" && return
-  fi
+is_ccswitch_base() {
+  [[ "$(normalize_base_url "$1")" == "$normalized_ccswitch_base" ]]
+}
 
-  if [[ -f "$OLD_INSTALL_ROOT/config.env" ]]; then
-    read_upstream_from_env "$OLD_INSTALL_ROOT/config.env" && return
+is_guard_base() {
+  local base="$1"
+  local normalized_base
+  normalized_base="$(normalize_base_url "$base")"
+  local listen
+  listen="$(read_env_key "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
+  if [[ -n "$listen" ]] && [[ "$normalized_base" == "$(normalize_base_url "http://127.0.0.1:$listen/v1")" ]]; then
+    return 0
   fi
+  return 1
+}
+
+read_upstream_from_env() {
+  read_env_key "$1" UPSTREAM_BASE
+}
+
+read_existing_upstream() {
+  read_upstream_from_env "$INSTALL_ROOT/config.env" 2>/dev/null && return
+  read_upstream_from_env "$OLD_INSTALL_ROOT/config.env" 2>/dev/null && return
 
   local latest_backup
   latest_backup="$(ls -t "$BACKUP_DIR"/config.toml.backup-* 2>/dev/null | head -1 || true)"
@@ -159,44 +229,32 @@ read_existing_upstream() {
   return 1
 }
 
-read_upstream_from_env() {
-  python3 - "$1" <<'PY'
-import shlex
-import sys
-from pathlib import Path
-
-for line in Path(sys.argv[1]).read_text().splitlines():
-    if line.startswith("UPSTREAM_BASE="):
-        print(shlex.split(line, posix=True)[0].split("=", 1)[1])
-        raise SystemExit(0)
-raise SystemExit(1)
-PY
-}
-
-if is_local_base "$current_base"; then
-  upstream_base="$(read_existing_upstream || true)"
-  [[ -n "${upstream_base:-}" ]] || fail "Codex already points to a local proxy, but no original upstream was found. Restore config.toml or set CODEX_SANITIZER_UPSTREAM."
-else
-  upstream_base="$current_base"
-fi
-
 if [[ -n "${CODEX_SANITIZER_UPSTREAM:-}" ]]; then
   upstream_base="$CODEX_SANITIZER_UPSTREAM"
+elif is_ccswitch_base "$current_base"; then
+  upstream_base="$ccswitch_base"
+elif is_guard_base "$current_base"; then
+  upstream_base="$(read_existing_upstream || true)"
+  [[ -n "${upstream_base:-}" ]] || fail "Codex already points to this guard, but no saved upstream was found. Restore config.toml or set CODEX_SANITIZER_UPSTREAM."
+elif is_local_base "$current_base"; then
+  fail "Codex already points to an unknown local proxy ($current_base). To avoid a proxy loop, set CODEX_SANITIZER_UPSTREAM explicitly."
+else
+  upstream_base="$current_base"
 fi
 
 stop_existing_agents
 
 choose_port() {
-  local existing_port=""
-  if [[ "$current_base" =~ '^http://(127\.0\.0\.1|localhost):([0-9]+)/v1/?$' ]]; then
-    existing_port="${match[2]}"
-  fi
-  if [[ -n "$existing_port" ]]; then
+  local existing_port
+  existing_port="$(read_env_key "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
+  if [[ -n "$existing_port" ]] && [[ "$existing_port" != "$ccswitch_port" ]] && ! lsof -nP -iTCP:"$existing_port" -sTCP:LISTEN >/dev/null 2>&1; then
     printf '%s\n' "$existing_port"
     return
   fi
+
   local port
   for port in $(seq "$DEFAULT_PORT" "$MAX_PORT"); do
+    [[ "$port" == "$ccswitch_port" ]] && continue
     if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
       printf '%s\n' "$port"
       return
@@ -251,6 +309,7 @@ LISTEN_HOST=127.0.0.1
 LISTEN_PORT=$listen_port
 NO_PROXY=$(printf '%q' "$no_proxy_value")
 UPSTREAM_PROXY_MODE=$upstream_proxy_mode
+CCSWITCH_URL=$(printf '%q' "$ccswitch_base")
 EOF_CONFIG
 chmod 600 "$INSTALL_ROOT/config.env"
 
@@ -315,6 +374,12 @@ EXPLICIT_IMAGE_PATTERNS = [
     r"生图",
     r"画一张",
 ]
+NEGATIVE_IMAGE_PATTERNS = [
+    r"(不要|不用|不需要|无需|别|禁止).{0,8}(生成.{0,4}(图片|图像|图)|生图|画图|画一张|绘制)",
+    r"(不要|不用|不需要|无需|别|禁止).{0,8}(image_generation|generate\s+(an?\s+)?image|create\s+(an?\s+)?image|draw\s+(an?\s+)?image)",
+    r"\b(do not|don't|dont|no need to|without)\s+(use\s+)?(image_generation|generate\s+(an?\s+)?image|create\s+(an?\s+)?image|draw\s+(an?\s+)?image)",
+    r"\bno\s+image\s+generation\b",
+]
 
 
 def setup_logging() -> None:
@@ -370,6 +435,8 @@ def has_explicit_image_intent(payload: Any) -> bool:
     else:
         collect_text(payload, chunks)
     text = "\n".join(chunks).lower()
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in NEGATIVE_IMAGE_PATTERNS):
+        return False
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in EXPLICIT_IMAGE_PATTERNS)
 
 
@@ -601,6 +668,326 @@ rm -f "$PLIST_PATH"
 echo "Codex imagegen guard uninstalled. Logs and backups remain in $INSTALL_ROOT and $BACKUP_DIR."
 SH_UNINSTALL
 
+cat > "$INSTALL_ROOT/doctor.sh" <<'SH_DOCTOR'
+#!/bin/zsh
+set -euo pipefail
+
+LABEL="dev.codex-imagegen-guard.agent"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+INSTALL_ROOT="$CODEX_HOME/imagegen-guard"
+CONFIG_FILE="$CODEX_HOME/config.toml"
+DEFAULT_CCSWITCH_URL="http://127.0.0.1:15721/v1"
+
+read_config_value() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import re
+import shlex
+import sys
+from pathlib import Path
+
+kind, path_raw, key = sys.argv[1:4]
+path = Path(path_raw)
+if not path.exists():
+    raise SystemExit(1)
+
+if kind == "env":
+    for line in path.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            try:
+                parsed = shlex.split(line.split("=", 1)[1], posix=True)
+                print(parsed[0] if parsed else "")
+            except ValueError:
+                print(line.split("=", 1)[1].strip("'\""))
+            raise SystemExit(0)
+    raise SystemExit(1)
+
+provider = key
+in_provider = False
+provider_header = f"[model_providers.{provider}]"
+for line in path.read_text().splitlines():
+    stripped = line.strip()
+    if stripped == provider_header:
+        in_provider = True
+        continue
+    if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+        break
+    if in_provider:
+        match = re.match(r'base_url\s*=\s*"([^"]+)"', stripped)
+        if match:
+            print(match.group(1))
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+read_active_provider() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+for line in path.read_text().splitlines():
+    match = re.match(r'\s*model_provider\s*=\s*"([^"]+)"', line)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+print("Codex")
+PY
+}
+
+normalize_base_url() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+raw = sys.argv[1].strip().rstrip("/")
+parsed = urllib.parse.urlparse(raw)
+host = parsed.hostname or ""
+if host == "localhost":
+    host = "127.0.0.1"
+port = f":{parsed.port}" if parsed.port else ""
+path = (parsed.path or "").rstrip("/")
+print(urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", "")))
+PY
+}
+
+is_local_base() {
+  [[ "$1" == http://127.0.0.1:* || "$1" == http://localhost:* ]]
+}
+
+saved_ccswitch_url="$(read_config_value env "$INSTALL_ROOT/config.env" CCSWITCH_URL 2>/dev/null || true)"
+CCSWITCH_URL="${CODEX_SANITIZER_CCSWITCH_URL:-${saved_ccswitch_url:-$DEFAULT_CCSWITCH_URL}}"
+provider="$(read_active_provider "$CONFIG_FILE" 2>/dev/null || true)"
+current_base="$(read_config_value toml "$CONFIG_FILE" "$provider" 2>/dev/null || true)"
+listen_port="$(read_config_value env "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
+upstream_base="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASE 2>/dev/null || true)"
+listen_port="${listen_port:-11435}"
+guard_base="http://127.0.0.1:$listen_port/v1"
+chain_status="unknown"
+
+if [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$guard_base")" ]]; then
+  chain_status="ok"
+elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$CCSWITCH_URL")" ]]; then
+  chain_status="bypassed-cc-switch"
+elif is_local_base "$current_base"; then
+  chain_status="unknown-local"
+else
+  chain_status="bypassed-remote"
+fi
+
+echo "status=$chain_status"
+echo "provider=$provider"
+echo "codex_base_url=$current_base"
+echo "guard_base_url=$guard_base"
+echo "guard_upstream=$upstream_base"
+
+if lsof -nP -iTCP:"$listen_port" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "guard_listening=yes"
+else
+  echo "guard_listening=no"
+fi
+
+ccswitch_port="$(python3 - "$CCSWITCH_URL" <<'PY'
+import sys
+import urllib.parse
+parsed = urllib.parse.urlparse(sys.argv[1])
+print(parsed.port or 80)
+PY
+)"
+if lsof -nP -iTCP:"$ccswitch_port" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "ccswitch_listening=yes"
+else
+  echo "ccswitch_listening=no"
+fi
+
+launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && echo "launchagent=running" || echo "launchagent=not-running"
+SH_DOCTOR
+
+cat > "$INSTALL_ROOT/repair.sh" <<'SH_REPAIR'
+#!/bin/zsh
+set -euo pipefail
+
+LABEL="dev.codex-imagegen-guard.agent"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+INSTALL_ROOT="$CODEX_HOME/imagegen-guard"
+BACKUP_DIR="$CODEX_HOME/backups/imagegen-guard"
+CONFIG_FILE="$CODEX_HOME/config.toml"
+DEFAULT_CCSWITCH_URL="http://127.0.0.1:15721/v1"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+
+mkdir -p "$INSTALL_ROOT/logs" "$BACKUP_DIR"
+
+read_config_value() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import re
+import shlex
+import sys
+from pathlib import Path
+
+kind, path_raw, key = sys.argv[1:4]
+path = Path(path_raw)
+if not path.exists():
+    raise SystemExit(1)
+
+if kind == "env":
+    for line in path.read_text().splitlines():
+        if line.startswith(f"{key}="):
+            try:
+                parsed = shlex.split(line.split("=", 1)[1], posix=True)
+                print(parsed[0] if parsed else "")
+            except ValueError:
+                print(line.split("=", 1)[1].strip("'\""))
+            raise SystemExit(0)
+    raise SystemExit(1)
+
+provider = key
+in_provider = False
+provider_header = f"[model_providers.{provider}]"
+for line in path.read_text().splitlines():
+    stripped = line.strip()
+    if stripped == provider_header:
+        in_provider = True
+        continue
+    if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+        break
+    if in_provider:
+        match = re.match(r'base_url\s*=\s*"([^"]+)"', stripped)
+        if match:
+            print(match.group(1))
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+read_active_provider() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+for line in path.read_text().splitlines():
+    match = re.match(r'\s*model_provider\s*=\s*"([^"]+)"', line)
+    if match:
+        print(match.group(1))
+        raise SystemExit(0)
+print("Codex")
+PY
+}
+
+normalize_base_url() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+raw = sys.argv[1].strip().rstrip("/")
+parsed = urllib.parse.urlparse(raw)
+host = parsed.hostname or ""
+if host == "localhost":
+    host = "127.0.0.1"
+port = f":{parsed.port}" if parsed.port else ""
+path = (parsed.path or "").rstrip("/")
+print(urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", "")))
+PY
+}
+
+is_local_base() {
+  [[ "$1" == http://127.0.0.1:* || "$1" == http://localhost:* ]]
+}
+
+saved_ccswitch_url="$(read_config_value env "$INSTALL_ROOT/config.env" CCSWITCH_URL 2>/dev/null || true)"
+CCSWITCH_URL="${CODEX_SANITIZER_CCSWITCH_URL:-${saved_ccswitch_url:-$DEFAULT_CCSWITCH_URL}}"
+provider="${CODEX_SANITIZER_PROVIDER:-$(read_active_provider "$CONFIG_FILE")}"
+current_base="$(read_config_value toml "$CONFIG_FILE" "$provider" || true)"
+listen_port="$(read_config_value env "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
+listen_host="$(read_config_value env "$INSTALL_ROOT/config.env" LISTEN_HOST 2>/dev/null || true)"
+no_proxy_value="$(read_config_value env "$INSTALL_ROOT/config.env" NO_PROXY 2>/dev/null || true)"
+proxy_mode="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_PROXY_MODE 2>/dev/null || true)"
+listen_port="${listen_port:-11435}"
+listen_host="${listen_host:-127.0.0.1}"
+no_proxy_value="${CODEX_SANITIZER_NO_PROXY:-${no_proxy_value:-127.0.0.1,localhost,::1}}"
+proxy_mode="${CODEX_SANITIZER_UPSTREAM_PROXY_MODE:-${proxy_mode:-system}}"
+guard_base="http://127.0.0.1:$listen_port/v1"
+
+if [[ -n "${CODEX_SANITIZER_UPSTREAM:-}" ]]; then
+  upstream_base="$CODEX_SANITIZER_UPSTREAM"
+elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$CCSWITCH_URL")" ]]; then
+  upstream_base="$CCSWITCH_URL"
+elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$guard_base")" ]]; then
+  upstream_base="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASE 2>/dev/null || true)"
+elif is_local_base "$current_base"; then
+  echo "ERROR: Codex points to unknown local proxy: $current_base" >&2
+  echo "Set CODEX_SANITIZER_UPSTREAM explicitly to avoid a proxy loop." >&2
+  exit 1
+else
+  upstream_base="$current_base"
+fi
+
+[[ -n "$upstream_base" ]] || {
+  echo "ERROR: no upstream could be determined. Set CODEX_SANITIZER_UPSTREAM." >&2
+  exit 1
+}
+
+cp -p "$CONFIG_FILE" "$BACKUP_DIR/config.toml.repair-$STAMP"
+
+cat > "$INSTALL_ROOT/config.env" <<EOF_CONFIG
+UPSTREAM_BASE=$(printf '%q' "$upstream_base")
+LISTEN_HOST=$listen_host
+LISTEN_PORT=$listen_port
+NO_PROXY=$(printf '%q' "$no_proxy_value")
+UPSTREAM_PROXY_MODE=$proxy_mode
+CCSWITCH_URL=$(printf '%q' "$CCSWITCH_URL")
+EOF_CONFIG
+chmod 600 "$INSTALL_ROOT/config.env"
+
+python3 - "$CONFIG_FILE" "$listen_port" "$provider" <<'PY_EDIT_CONFIG'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+port = sys.argv[2]
+provider = sys.argv[3]
+lines = path.read_text().splitlines()
+out = []
+in_provider = False
+changed = False
+provider_header = f"[model_providers.{provider}]"
+for line in lines:
+    stripped = line.strip()
+    if stripped == provider_header:
+        in_provider = True
+        out.append(line)
+        continue
+    if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+        in_provider = False
+    if in_provider and re.match(r'\s*base_url\s*=', line):
+        prefix = line[: len(line) - len(line.lstrip())]
+        out.append(f'{prefix}base_url = "http://127.0.0.1:{port}/v1"')
+        changed = True
+    else:
+        out.append(line)
+
+if not changed:
+    raise SystemExit(f"failed to update [model_providers.{provider}] base_url")
+path.write_text("\n".join(out) + "\n")
+PY_EDIT_CONFIG
+
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+fi
+
+echo "Repaired Codex imagegen guard chain."
+echo "Provider: $provider"
+echo "Upstream: $upstream_base"
+echo "Local base_url: http://127.0.0.1:$listen_port/v1"
+SH_REPAIR
+
 cat > "$INSTALL_ROOT/README.md" <<EOF_README
 # Codex Imagegen Guard
 
@@ -621,15 +1008,23 @@ cat > "$INSTALL_ROOT/README.md" <<EOF_README
 - 本机地址：\`http://127.0.0.1:$listen_port/v1\`
 - 上游代理模式：\`$upstream_proxy_mode\`
 - 本机代理绕过：\`$no_proxy_value\`
+- CC Switch 默认路由：\`$ccswitch_base\`
 - LaunchAgent：\`$PLIST_PATH\`
 
 ## 验证
 
 \`\`\`zsh
+"$INSTALL_ROOT/doctor.sh"
 launchctl print gui/\$(id -u)/$LABEL
 lsof -nP -iTCP:$listen_port -sTCP:LISTEN
 curl -i --noproxy 127.0.0.1 http://127.0.0.1:$listen_port/healthz
 tail -30 "$INSTALL_ROOT/logs/proxy.log"
+\`\`\`
+
+如果开启 CC Switch 后 Codex 又被改到 CC Switch 路由，可运行：
+
+\`\`\`zsh
+"$INSTALL_ROOT/repair.sh"
 \`\`\`
 
 ## 卸载
@@ -641,7 +1036,7 @@ tail -30 "$INSTALL_ROOT/logs/proxy.log"
 卸载会恢复最近一次安装前的 \`config.toml\` 备份，并停止 LaunchAgent。
 EOF_README
 
-chmod 700 "$INSTALL_ROOT/codex_imagegen_guard.py" "$INSTALL_ROOT/uninstall.sh"
+chmod 700 "$INSTALL_ROOT/codex_imagegen_guard.py" "$INSTALL_ROOT/uninstall.sh" "$INSTALL_ROOT/doctor.sh" "$INSTALL_ROOT/repair.sh"
 
 python3 - "$CONFIG_FILE" "$listen_port" "$provider_name" <<'PY_EDIT_CONFIG'
 import re
