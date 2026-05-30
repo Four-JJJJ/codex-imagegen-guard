@@ -303,6 +303,7 @@ URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})) if UPS
 
 IMAGE_TOOL_NAMES = {"image_generation"}
 USER_TEXT_KEYS = {"input", "text", "input_text", "content", "message", "prompt"}
+USER_ROLE_KEYS = {"user", "human"}
 EXPLICIT_IMAGE_PATTERNS = [
     r"\bimage_generation\b",
     r"\bgenerate\s+(an?\s+)?image\b",
@@ -336,9 +337,38 @@ def collect_text(value: Any, chunks: list[str]) -> None:
             collect_text(child, chunks)
 
 
+def collect_user_text(value: Any, chunks: list[str]) -> None:
+    if isinstance(value, dict):
+        role = value.get("role")
+        if isinstance(role, str) and role.lower() in USER_ROLE_KEYS:
+            collect_text(value, chunks)
+            return
+        for child in value.values():
+            collect_user_text(child, chunks)
+    elif isinstance(value, list):
+        for child in value:
+            collect_user_text(child, chunks)
+
+
+def latest_input_payload(payload: dict[str, Any]) -> Any:
+    for key in ("input", "messages"):
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            return value[-1]
+        if isinstance(value, str):
+            return value
+    return payload
+
+
 def has_explicit_image_intent(payload: Any) -> bool:
     chunks: list[str] = []
-    collect_text(payload, chunks)
+    if isinstance(payload, dict):
+        current = latest_input_payload(payload)
+        collect_user_text(current, chunks)
+        if not chunks:
+            collect_text(current, chunks)
+    else:
+        collect_text(payload, chunks)
     text = "\n".join(chunks).lower()
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in EXPLICIT_IMAGE_PATTERNS)
 
