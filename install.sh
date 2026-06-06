@@ -320,7 +320,10 @@ import logging
 import os
 import re
 import shlex
+import socket
+import ssl
 import sys
+import http.client
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -359,6 +362,7 @@ os.environ["NO_PROXY"] = NO_PROXY_VALUE
 os.environ["no_proxy"] = NO_PROXY_VALUE
 UPSTREAM_PROXY_MODE = os.environ.get("CODEX_SANITIZER_UPSTREAM_PROXY_MODE", CONFIG.get("UPSTREAM_PROXY_MODE", "system"))
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})) if UPSTREAM_PROXY_MODE == "direct" else urllib.request.build_opener()
+STREAM_CHUNK_SIZE = int(os.environ.get("CODEX_SANITIZER_STREAM_CHUNK_SIZE", CONFIG.get("STREAM_CHUNK_SIZE", "8192")))
 
 IMAGE_TOOL_NAMES = {"image_generation"}
 USER_TEXT_KEYS = {"input", "text", "input_text", "content", "message", "prompt"}
@@ -491,6 +495,25 @@ def build_upstream_url(path: str) -> str:
     return f"{UPSTREAM_BASE}{path if path.startswith('/') else '/' + path}"
 
 
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+UPSTREAM_STREAM_ERRORS = (
+    socket.timeout,
+    TimeoutError,
+    ssl.SSLEOFError,
+    http.client.IncompleteRead,
+    http.client.RemoteDisconnected,
+)
+
+
+def is_html_response(content_type: str, sample: bytes = b"") -> bool:
+    sample = sample.lstrip().lower()
+    return "text/html" in content_type.lower() or sample.startswith(b"<!doctype html") or sample.startswith(b"<html")
+
+
+def short_error(error: BaseException) -> str:
+    return f"{error.__class__.__name__}: {error}"
+
+
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -499,8 +522,33 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 class ProxyHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def setup(self) -> None:
+        super().setup()
+        self._headers_sent = False
+
     def log_message(self, fmt: str, *args: Any) -> None:
         logging.info("%s - %s", self.client_address[0], fmt % args)
+
+    def end_headers(self) -> None:
+        super().end_headers()
+        self._headers_sent = True
+
+    def safe_write(self, data: bytes) -> bool:
+        if not data:
+            return True
+        try:
+            self.wfile.write(data)
+            self.wfile.flush()
+            return True
+        except CLIENT_DISCONNECT_ERRORS:
+            logging.warning("client disconnected while streaming %s %s", self.command, self.path)
+            return False
+
+    def write_chunk(self, data: bytes) -> bool:
+        return self.safe_write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+
+    def finish_chunked_response(self) -> None:
+        self.safe_write(b"0\r\n\r\n")
 
     def do_OPTIONS(self) -> None:
         self.send_response(204)
@@ -534,8 +582,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
-        self.wfile.flush()
+        self.safe_write(body)
 
     def forward(self) -> None:
         if self.path in {"/healthz", "/v1/healthz"}:
@@ -562,30 +609,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         try:
             with URL_OPENER.open(request, timeout=900) as response:
-                content_type = response.headers.get("Content-Type", "")
-                first_chunk = response.read(65536)
-                if "text/html" in content_type.lower() or first_chunk.lstrip().lower().startswith(b"<!doctype html") or first_chunk.lstrip().lower().startswith(b"<html"):
-                    logging.warning("upstream returned html success status=%s path=%s", response.status, self.path)
-                    self.respond_json(502, {"error": {"message": "upstream proxy returned an HTML page instead of API JSON", "status": response.status}})
-                    return
-                self.send_response(response.status)
-                self.copy_response_headers(response.headers)
-                self.send_header("Connection", "close")
-                self.end_headers()
-                if first_chunk:
-                    self.wfile.write(first_chunk)
-                    self.wfile.flush()
-                while True:
-                    chunk = response.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if should_sanitize(self.path):
+                    self.stream_response(response)
+                else:
+                    self.buffered_response(response)
                 logging.info("%s %s -> %s sanitized=%s", self.command, self.path, response.status, sanitized)
         except urllib.error.HTTPError as error:
             error_body = error.read()
             content_type = error.headers.get("Content-Type", "")
-            if "text/html" in content_type.lower() or error_body.lstrip().lower().startswith(b"<!doctype html") or error_body.lstrip().lower().startswith(b"<html"):
+            if is_html_response(content_type, error_body):
                 logging.warning("upstream returned html error status=%s path=%s", error.code, self.path)
                 self.respond_json(error.code, {"error": {"message": "upstream proxy returned an HTML error page", "status": error.code}})
                 return
@@ -594,12 +626,106 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(error_body)))
             self.send_header("Connection", "close")
             self.end_headers()
-            self.wfile.write(error_body)
-            self.wfile.flush()
+            self.safe_write(error_body)
             logging.info("%s %s -> %s sanitized=%s", self.command, self.path, error.code, sanitized)
+        except CLIENT_DISCONNECT_ERRORS as error:
+            logging.warning("client disconnected before proxy response on %s %s: %s", self.command, self.path, short_error(error))
+        except UPSTREAM_STREAM_ERRORS as error:
+            logging.warning("upstream stream interrupted on %s %s: %s", self.command, self.path, short_error(error))
+            if not self._headers_sent:
+                self.respond_json(502, {"error": {"message": f"local Codex imagegen guard upstream stream interrupted: {error}"}})
+        except urllib.error.URLError as error:
+            logging.warning("upstream url error on %s %s: %s", self.command, self.path, short_error(error))
+            if not self._headers_sent:
+                self.respond_json(502, {"error": {"message": f"local Codex imagegen guard upstream error: {error.reason}"}})
         except Exception as error:
+            if self._headers_sent:
+                logging.warning("proxy stream ended with %s on %s %s", short_error(error), self.command, self.path)
+                return
             logging.exception("proxy error on %s %s", self.command, self.path)
             self.respond_json(502, {"error": {"message": f"local Codex imagegen guard proxy error: {error}"}})
+
+    def buffered_response(self, response: Any) -> None:
+        content_type = response.headers.get("Content-Type", "")
+        first_chunk = response.read(STREAM_CHUNK_SIZE)
+        if is_html_response(content_type, first_chunk):
+            logging.warning("upstream returned html success status=%s path=%s", response.status, self.path)
+            self.respond_json(502, {"error": {"message": "upstream proxy returned an HTML page instead of API JSON", "status": response.status}})
+            return
+        self.send_response(response.status)
+        self.copy_response_headers(response.headers)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if first_chunk and not self.safe_write(first_chunk):
+            return
+        while True:
+            chunk = response.read(STREAM_CHUNK_SIZE)
+            if not chunk:
+                break
+            if not self.safe_write(chunk):
+                break
+
+    def stream_response(self, response: Any) -> None:
+        content_type = response.headers.get("Content-Type", "")
+        if is_html_response(content_type):
+            logging.warning("upstream returned html streaming status=%s path=%s", response.status, self.path)
+            self.respond_json(502, {"error": {"message": "upstream proxy returned an HTML page instead of API JSON", "status": response.status}})
+            return
+
+        upstream_chunked = response.headers.get("Transfer-Encoding", "").lower() == "chunked"
+        self.send_response(response.status)
+        self.copy_response_headers(response.headers)
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.end_headers()
+
+        try:
+            if upstream_chunked and self.copy_raw_chunked_response(response):
+                return
+            while True:
+                chunk = response.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                if not self.write_chunk(chunk):
+                    return
+            self.finish_chunked_response()
+        except UPSTREAM_STREAM_ERRORS as error:
+            logging.warning("upstream stream interrupted on %s %s: %s", self.command, self.path, short_error(error))
+        except CLIENT_DISCONNECT_ERRORS as error:
+            logging.warning("client disconnected while streaming %s %s: %s", self.command, self.path, short_error(error))
+
+    def copy_raw_chunked_response(self, response: Any) -> bool:
+        raw = getattr(response, "fp", None)
+        if raw is None:
+            return False
+        while True:
+            line = raw.readline()
+            if not line:
+                return True
+            if not self.safe_write(line):
+                return True
+            try:
+                chunk_size = int(line.split(b";", 1)[0].strip(), 16)
+            except ValueError:
+                logging.warning("invalid upstream chunk header on %s %s: %r", self.command, self.path, line[:80])
+                return True
+            if chunk_size == 0:
+                while True:
+                    trailer = raw.readline()
+                    if not trailer:
+                        return True
+                    if not self.safe_write(trailer):
+                        return True
+                    if trailer in {b"\r\n", b"\n"}:
+                        return True
+            remaining = chunk_size + 2
+            while remaining > 0:
+                data = raw.read(min(STREAM_CHUNK_SIZE, remaining))
+                if not data:
+                    return True
+                remaining -= len(data)
+                if not self.safe_write(data):
+                    return True
 
     def upstream_headers(self, content_length: int) -> dict[str, str]:
         blocked = {"host", "content-length", "connection", "proxy-connection", "accept-encoding"}
