@@ -201,15 +201,26 @@ read_upstream_from_env() {
 }
 
 read_existing_upstream() {
-  read_upstream_from_env "$INSTALL_ROOT/config.env" 2>/dev/null && return
-  read_upstream_from_env "$OLD_INSTALL_ROOT/config.env" 2>/dev/null && return
+  local saved_upstream
+  saved_upstream="$(read_upstream_from_env "$INSTALL_ROOT/config.env" 2>/dev/null || true)"
+  if [[ -n "$saved_upstream" ]] && ! is_guard_base "$saved_upstream"; then
+    printf '%s\n' "$saved_upstream"
+    return
+  fi
+
+  local old_saved_upstream
+  old_saved_upstream="$(read_upstream_from_env "$OLD_INSTALL_ROOT/config.env" 2>/dev/null || true)"
+  if [[ -n "$old_saved_upstream" ]] && ! is_guard_base "$old_saved_upstream"; then
+    printf '%s\n' "$old_saved_upstream"
+    return
+  fi
 
   local latest_backup
   latest_backup="$(ls -t "$BACKUP_DIR"/config.toml.backup-* 2>/dev/null | head -1 || true)"
   if [[ -n "$latest_backup" ]]; then
     local backup_base
     backup_base="$(read_codex_base_url "$latest_backup" "$provider_name" || true)"
-    if [[ -n "$backup_base" ]] && ! is_local_base "$backup_base"; then
+    if [[ -n "$backup_base" ]] && ! is_guard_base "$backup_base"; then
       printf '%s\n' "$backup_base"
       return
     fi
@@ -220,7 +231,7 @@ read_existing_upstream() {
   if [[ -n "$old_latest_backup" ]]; then
     local old_backup_base
     old_backup_base="$(read_codex_base_url "$old_latest_backup" "$provider_name" || true)"
-    if [[ -n "$old_backup_base" ]] && ! is_local_base "$old_backup_base"; then
+    if [[ -n "$old_backup_base" ]] && ! is_guard_base "$old_backup_base"; then
       printf '%s\n' "$old_backup_base"
       return
     fi
@@ -237,17 +248,19 @@ elif is_guard_base "$current_base"; then
   upstream_base="$(read_existing_upstream || true)"
   [[ -n "${upstream_base:-}" ]] || fail "Codex already points to this guard, but no saved upstream was found. Restore config.toml or set CODEX_SANITIZER_UPSTREAM."
 elif is_local_base "$current_base"; then
-  fail "Codex already points to an unknown local proxy ($current_base). To avoid a proxy loop, set CODEX_SANITIZER_UPSTREAM explicitly."
+  upstream_base="$current_base"
 else
   upstream_base="$current_base"
 fi
+
+upstream_port="$(url_port "$upstream_base")"
 
 stop_existing_agents
 
 choose_port() {
   local existing_port
   existing_port="$(read_env_key "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
-  if [[ -n "$existing_port" ]] && [[ "$existing_port" != "$ccswitch_port" ]] && ! lsof -nP -iTCP:"$existing_port" -sTCP:LISTEN >/dev/null 2>&1; then
+  if [[ -n "$existing_port" ]] && [[ "$existing_port" != "$ccswitch_port" ]] && [[ "$existing_port" != "$upstream_port" ]] && ! lsof -nP -iTCP:"$existing_port" -sTCP:LISTEN >/dev/null 2>&1; then
     printf '%s\n' "$existing_port"
     return
   fi
@@ -255,6 +268,7 @@ choose_port() {
   local port
   for port in $(seq "$DEFAULT_PORT" "$MAX_PORT"); do
     [[ "$port" == "$ccswitch_port" ]] && continue
+    [[ "$port" == "$upstream_port" ]] && continue
     if ! lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
       printf '%s\n' "$port"
       return
@@ -899,7 +913,7 @@ if [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$guard_b
 elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$CCSWITCH_URL")" ]]; then
   chain_status="bypassed-cc-switch"
 elif is_local_base "$current_base"; then
-  chain_status="unknown-local"
+  chain_status="bypassed-local-upstream"
 else
   chain_status="bypassed-remote"
 fi
@@ -1047,9 +1061,7 @@ elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$CCSWI
 elif [[ "$(normalize_base_url "$current_base")" == "$(normalize_base_url "$guard_base")" ]]; then
   upstream_base="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASE 2>/dev/null || true)"
 elif is_local_base "$current_base"; then
-  echo "ERROR: Codex points to unknown local proxy: $current_base" >&2
-  echo "Set CODEX_SANITIZER_UPSTREAM explicitly to avoid a proxy loop." >&2
-  exit 1
+  upstream_base="$current_base"
 else
   upstream_base="$current_base"
 fi
@@ -1134,7 +1146,7 @@ cat > "$INSTALL_ROOT/README.md" <<EOF_README
 - 本机地址：\`http://127.0.0.1:$listen_port/v1\`
 - 上游代理模式：\`$upstream_proxy_mode\`
 - 本机代理绕过：\`$no_proxy_value\`
-- CC Switch 默认路由：\`$ccswitch_base\`
+- 兼容 CC Switch 路由：\`$ccswitch_base\`
 - LaunchAgent：\`$PLIST_PATH\`
 
 ## 验证
@@ -1147,7 +1159,7 @@ curl -i --noproxy 127.0.0.1 http://127.0.0.1:$listen_port/healthz
 tail -30 "$INSTALL_ROOT/logs/proxy.log"
 \`\`\`
 
-如果开启 CC Switch 后 Codex 又被改到 CC Switch 路由，可运行：
+如果中转站后续又把 Codex 改回自己的路由，可运行：
 
 \`\`\`zsh
 "$INSTALL_ROOT/repair.sh"
