@@ -93,6 +93,16 @@ Codex Desktop -> codex-imagegen-guard:11435 -> 当前本机中转站 -> 当前 P
 
 `doctor.sh` 的 `status=ok` 表示 Codex 正在经过 guard；`status=bypassed-local-upstream` 或 `status=bypassed-cc-switch` 表示本机中转站又接管了 Codex 入口，需要运行 `repair.sh`。
 
+切换已保存的上游：
+
+```zsh
+~/.codex/imagegen-guard/switch-upstream.sh hanhe
+~/.codex/imagegen-guard/switch-upstream.sh ailinyu
+~/.codex/imagegen-guard/switch-upstream.sh fourj
+~/.codex/imagegen-guard/switch-upstream.sh status
+~/.codex/imagegen-guard/switch-upstream.sh custom https://api.example.com
+```
+
 ## 高级配置
 
 安装时可通过环境变量覆盖默认行为：
@@ -108,10 +118,12 @@ zsh install.sh
 
 - `CODEX_SANITIZER_PROVIDER`：指定要修改的 Codex provider，默认读取当前 `model_provider`。
 - `CODEX_SANITIZER_UPSTREAM`：指定真实上游 `base_url`。
+- `CODEX_SANITIZER_UPSTREAM_FALLBACK`：额外备用上游。默认会保留 `https://api.hanhegufei.online/v1`、`https://ai.ailinyu.de/v1` 和 `https://token.fourj.space/v1` 作为候选，当前上游返回 `401` 时自动尝试下一个。
 - 上游识别不依赖域名名单：安装或修复时会读取当前 Codex provider 的 `base_url`，任意远程或本机 OpenAI-compatible 上游都可以。
 - `CODEX_SANITIZER_CCSWITCH_URL`：兼容旧版 CC Switch 判断的可选覆盖；一般不需要设置，脚本会优先读取当前 Codex `base_url`。
 - `CODEX_SANITIZER_NO_PROXY`：覆盖本服务使用的 `NO_PROXY`。
 - `CODEX_SANITIZER_UPSTREAM_PROXY_MODE`：`system` 或 `direct`。默认 `system`，表示上游继续走系统代理。
+- `CODEX_SANITIZER_RETRY_STATUSES`：触发备用上游重试的 HTTP 状态码，默认 `401`。
 
 ## 卸载
 

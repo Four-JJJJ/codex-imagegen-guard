@@ -200,6 +200,25 @@ read_upstream_from_env() {
   read_env_key "$1" UPSTREAM_BASE
 }
 
+append_unique_upstream() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 0
+  if [[ "$candidate" == *,* ]]; then
+    local part
+    for part in ${(s:,:)candidate}; do
+      append_unique_upstream "$part"
+    done
+    return
+  fi
+  local normalized_candidate
+  normalized_candidate="$(normalize_base_url "$candidate")"
+  local existing
+  for existing in "${upstream_bases[@]}"; do
+    [[ "$(normalize_base_url "$existing")" == "$normalized_candidate" ]] && return
+  done
+  upstream_bases+=("$candidate")
+}
+
 read_existing_upstream() {
   local saved_upstream
   saved_upstream="$(read_upstream_from_env "$INSTALL_ROOT/config.env" 2>/dev/null || true)"
@@ -253,6 +272,14 @@ else
   upstream_base="$current_base"
 fi
 
+upstream_bases=()
+append_unique_upstream "$upstream_base"
+append_unique_upstream "${CODEX_SANITIZER_UPSTREAM_FALLBACK:-}"
+append_unique_upstream "https://api.hanhegufei.online/v1"
+append_unique_upstream "https://ai.ailinyu.de/v1"
+append_unique_upstream "https://token.fourj.space/v1"
+upstream_bases_value="$(IFS=,; printf '%s' "${upstream_bases[*]}")"
+upstream_aliases_value="hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1"
 upstream_port="$(url_port "$upstream_base")"
 
 stop_existing_agents
@@ -319,6 +346,8 @@ fi
 
 cat > "$INSTALL_ROOT/config.env" <<EOF_CONFIG
 UPSTREAM_BASE=$(printf '%q' "$upstream_base")
+UPSTREAM_BASES=$(printf '%q' "$upstream_bases_value")
+UPSTREAM_ALIASES=$(printf '%q' "$upstream_aliases_value")
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=$listen_port
 NO_PROXY=$(printf '%q' "$no_proxy_value")
@@ -337,6 +366,7 @@ import shlex
 import socket
 import ssl
 import sys
+import threading
 import http.client
 import urllib.error
 import urllib.parse
@@ -370,6 +400,7 @@ CONFIG = load_config()
 LISTEN_HOST = os.environ.get("CODEX_SANITIZER_HOST", CONFIG.get("LISTEN_HOST", "127.0.0.1"))
 LISTEN_PORT = int(os.environ.get("CODEX_SANITIZER_PORT", CONFIG.get("LISTEN_PORT", "11435")))
 UPSTREAM_BASE = os.environ.get("CODEX_SANITIZER_UPSTREAM", CONFIG.get("UPSTREAM_BASE", "")).rstrip("/")
+UPSTREAM_LOCK = threading.Lock()
 LOG_PATH = os.path.expanduser(os.environ.get("CODEX_SANITIZER_LOG", "~/.codex/imagegen-guard/logs/proxy.log"))
 NO_PROXY_VALUE = CONFIG.get("NO_PROXY", "127.0.0.1,localhost,::1")
 os.environ["NO_PROXY"] = NO_PROXY_VALUE
@@ -377,6 +408,7 @@ os.environ["no_proxy"] = NO_PROXY_VALUE
 UPSTREAM_PROXY_MODE = os.environ.get("CODEX_SANITIZER_UPSTREAM_PROXY_MODE", CONFIG.get("UPSTREAM_PROXY_MODE", "system"))
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})) if UPSTREAM_PROXY_MODE == "direct" else urllib.request.build_opener()
 STREAM_CHUNK_SIZE = int(os.environ.get("CODEX_SANITIZER_STREAM_CHUNK_SIZE", CONFIG.get("STREAM_CHUNK_SIZE", "8192")))
+UPSTREAM_RETRY_STATUSES = {int(item.strip()) for item in os.environ.get("CODEX_SANITIZER_RETRY_STATUSES", CONFIG.get("RETRY_STATUSES", "401")).split(",") if item.strip()}
 
 IMAGE_TOOL_NAMES = {"image_generation"}
 USER_TEXT_KEYS = {"input", "text", "input_text", "content", "message", "prompt"}
@@ -403,6 +435,77 @@ NEGATIVE_IMAGE_PATTERNS = [
 def setup_logging() -> None:
     os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     logging.basicConfig(filename=LOG_PATH, level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+def normalize_base_url(raw: str) -> str:
+    parsed = urllib.parse.urlparse(raw.strip().rstrip("/"))
+    host = parsed.hostname or ""
+    if host == "localhost":
+        host = "127.0.0.1"
+    port = f":{parsed.port}" if parsed.port else ""
+    path = (parsed.path or "").rstrip("/")
+    return urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", ""))
+
+
+def split_upstream_bases(value: str) -> list[str]:
+    items: list[str] = []
+    seen: set[str] = set()
+    for part in value.split(","):
+        item = part.strip().rstrip("/")
+        if not item:
+            continue
+        key = normalize_base_url(item)
+        if key not in seen:
+            seen.add(key)
+            items.append(item)
+    return items
+
+
+UPSTREAM_BASES = split_upstream_bases(os.environ.get("CODEX_SANITIZER_UPSTREAMS", CONFIG.get("UPSTREAM_BASES", "")))
+if UPSTREAM_BASE:
+    UPSTREAM_BASES = split_upstream_bases(",".join([UPSTREAM_BASE, *UPSTREAM_BASES]))
+UPSTREAM_BASE = UPSTREAM_BASES[0] if UPSTREAM_BASES else UPSTREAM_BASE
+
+
+def current_upstream_base() -> str:
+    with UPSTREAM_LOCK:
+        return UPSTREAM_BASE
+
+
+def ordered_upstream_bases() -> list[str]:
+    with UPSTREAM_LOCK:
+        current = UPSTREAM_BASE
+        bases = list(UPSTREAM_BASES)
+    if not current:
+        return bases
+    return split_upstream_bases(",".join([current, *bases]))
+
+
+def persist_current_upstream(base_url: str) -> None:
+    ROOT.mkdir(parents=True, exist_ok=True)
+    lines = CONFIG_PATH.read_text().splitlines() if CONFIG_PATH.exists() else []
+    out: list[str] = []
+    changed = False
+    for line in lines:
+        if line.startswith("UPSTREAM_BASE="):
+            out.append(f"UPSTREAM_BASE={shlex.quote(base_url)}")
+            changed = True
+        else:
+            out.append(line)
+    if not changed:
+        out.append(f"UPSTREAM_BASE={shlex.quote(base_url)}")
+    CONFIG_PATH.write_text("\n".join(out) + "\n")
+    CONFIG_PATH.chmod(0o600)
+
+
+def set_current_upstream(base_url: str) -> None:
+    global UPSTREAM_BASE
+    with UPSTREAM_LOCK:
+        if normalize_base_url(base_url) == normalize_base_url(UPSTREAM_BASE):
+            return
+        UPSTREAM_BASE = base_url
+    persist_current_upstream(base_url)
+    logging.info("switched active upstream to %s", base_url)
 
 
 def collect_text(value: Any, chunks: list[str]) -> None:
@@ -503,10 +606,10 @@ def should_sanitize(path: str) -> bool:
     return path == "/v1/responses" or path.startswith("/v1/responses?")
 
 
-def build_upstream_url(path: str) -> str:
-    if UPSTREAM_BASE.endswith("/v1") and (path == "/v1" or path.startswith("/v1/") or path.startswith("/v1?")):
+def build_upstream_url(path: str, upstream_base: str) -> str:
+    if upstream_base.endswith("/v1") and (path == "/v1" or path.startswith("/v1/") or path.startswith("/v1?")):
         path = path.removeprefix("/v1") or "/"
-    return f"{UPSTREAM_BASE}{path if path.startswith('/') else '/' + path}"
+    return f"{upstream_base}{path if path.startswith('/') else '/' + path}"
 
 
 CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
@@ -600,9 +703,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
     def forward(self) -> None:
         if self.path in {"/healthz", "/v1/healthz"}:
-            self.respond_json(200, {"status": "ok", "upstream": UPSTREAM_BASE, "listen": f"{LISTEN_HOST}:{LISTEN_PORT}"})
+            self.respond_json(200, {"status": "ok", "upstream": current_upstream_base(), "upstreams": ordered_upstream_bases(), "listen": f"{LISTEN_HOST}:{LISTEN_PORT}"})
             return
-        if not UPSTREAM_BASE:
+        upstream_bases = ordered_upstream_bases()
+        if not upstream_bases:
             self.respond_json(502, {"error": {"message": "local Codex imagegen guard proxy is not configured: UPSTREAM_BASE is empty"}})
             return
 
@@ -617,31 +721,49 @@ class ProxyHandler(BaseHTTPRequestHandler):
             except json.JSONDecodeError:
                 logging.warning("invalid JSON on %s; forwarded unchanged", self.path)
 
-        upstream_url = build_upstream_url(self.path)
-        headers = self.upstream_headers(len(body))
-        request = urllib.request.Request(upstream_url, data=body if self.command not in {"GET", "HEAD"} else None, headers=headers, method=self.command)
-
         try:
-            with URL_OPENER.open(request, timeout=900) as response:
-                if should_sanitize(self.path):
-                    self.stream_response(response)
-                else:
-                    self.buffered_response(response)
-                logging.info("%s %s -> %s sanitized=%s", self.command, self.path, response.status, sanitized)
+            for index, upstream_base in enumerate(upstream_bases):
+                upstream_url = build_upstream_url(self.path, upstream_base)
+                headers = self.upstream_headers(len(body), upstream_base)
+                request = urllib.request.Request(upstream_url, data=body if self.command not in {"GET", "HEAD"} else None, headers=headers, method=self.command)
+
+                with URL_OPENER.open(request, timeout=900) as response:
+                    if normalize_base_url(upstream_base) != normalize_base_url(current_upstream_base()):
+                        set_current_upstream(upstream_base)
+                    if should_sanitize(self.path):
+                        self.stream_response(response)
+                    else:
+                        self.buffered_response(response)
+                    logging.info("%s %s -> %s upstream=%s sanitized=%s", self.command, self.path, response.status, upstream_base, sanitized)
+                    return
         except urllib.error.HTTPError as error:
-            error_body = error.read()
-            content_type = error.headers.get("Content-Type", "")
-            if is_html_response(content_type, error_body):
-                logging.warning("upstream returned html error status=%s path=%s", error.code, self.path)
-                self.respond_json(error.code, {"error": {"message": "upstream proxy returned an HTML error page", "status": error.code}})
-                return
-            self.send_response(error.code)
-            self.copy_response_headers(error.headers)
-            self.send_header("Content-Length", str(len(error_body)))
-            self.send_header("Connection", "close")
-            self.end_headers()
-            self.safe_write(error_body)
-            logging.info("%s %s -> %s sanitized=%s", self.command, self.path, error.code, sanitized)
+            current_index = upstream_bases.index(upstream_base) if upstream_base in upstream_bases else 0
+            if error.code in UPSTREAM_RETRY_STATUSES and current_index + 1 < len(upstream_bases):
+                logging.warning("%s %s -> %s upstream=%s; retrying next upstream", self.command, self.path, error.code, upstream_base)
+                error.close()
+                remaining_bases = upstream_bases[current_index + 1 :]
+                for retry_base in remaining_bases:
+                    retry_url = build_upstream_url(self.path, retry_base)
+                    retry_headers = self.upstream_headers(len(body), retry_base)
+                    retry_request = urllib.request.Request(retry_url, data=body if self.command not in {"GET", "HEAD"} else None, headers=retry_headers, method=self.command)
+                    try:
+                        with URL_OPENER.open(retry_request, timeout=900) as response:
+                            if normalize_base_url(retry_base) != normalize_base_url(current_upstream_base()):
+                                set_current_upstream(retry_base)
+                            if should_sanitize(self.path):
+                                self.stream_response(response)
+                            else:
+                                self.buffered_response(response)
+                            logging.info("%s %s -> %s upstream=%s sanitized=%s", self.command, self.path, response.status, retry_base, sanitized)
+                            return
+                    except urllib.error.HTTPError as retry_error:
+                        if retry_error.code in UPSTREAM_RETRY_STATUSES and retry_base != remaining_bases[-1]:
+                            logging.warning("%s %s -> %s upstream=%s; retrying next upstream", self.command, self.path, retry_error.code, retry_base)
+                            retry_error.close()
+                            continue
+                        self.forward_http_error(retry_error, sanitized, retry_base)
+                        return
+            self.forward_http_error(error, sanitized, upstream_base)
         except CLIENT_DISCONNECT_ERRORS as error:
             logging.warning("client disconnected before proxy response on %s %s: %s", self.command, self.path, short_error(error))
         except UPSTREAM_STREAM_ERRORS as error:
@@ -658,6 +780,21 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 return
             logging.exception("proxy error on %s %s", self.command, self.path)
             self.respond_json(502, {"error": {"message": f"local Codex imagegen guard proxy error: {error}"}})
+
+    def forward_http_error(self, error: urllib.error.HTTPError, sanitized: bool, upstream_base: str) -> None:
+        error_body = error.read()
+        content_type = error.headers.get("Content-Type", "")
+        if is_html_response(content_type, error_body):
+            logging.warning("upstream returned html error status=%s path=%s upstream=%s", error.code, self.path, upstream_base)
+            self.respond_json(error.code, {"error": {"message": "upstream proxy returned an HTML error page", "status": error.code}})
+            return
+        self.send_response(error.code)
+        self.copy_response_headers(error.headers)
+        self.send_header("Content-Length", str(len(error_body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.safe_write(error_body)
+        logging.info("%s %s -> %s upstream=%s sanitized=%s", self.command, self.path, error.code, upstream_base, sanitized)
 
     def buffered_response(self, response: Any) -> None:
         content_type = response.headers.get("Content-Type", "")
@@ -898,13 +1035,29 @@ is_local_base() {
   [[ "$1" == http://127.0.0.1:* || "$1" == http://localhost:* ]]
 }
 
+append_unique_upstream() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return 0
+  local normalized_candidate
+  normalized_candidate="$(normalize_base_url "$candidate")"
+  local existing
+  for existing in "${upstream_bases[@]}"; do
+    [[ "$(normalize_base_url "$existing")" == "$normalized_candidate" ]] && return
+  done
+  upstream_bases+=("$candidate")
+}
+
 saved_ccswitch_url="$(read_config_value env "$INSTALL_ROOT/config.env" CCSWITCH_URL 2>/dev/null || true)"
 CCSWITCH_URL="${CODEX_SANITIZER_CCSWITCH_URL:-${saved_ccswitch_url:-$DEFAULT_CCSWITCH_URL}}"
 provider="$(read_active_provider "$CONFIG_FILE" 2>/dev/null || true)"
 current_base="$(read_config_value toml "$CONFIG_FILE" "$provider" 2>/dev/null || true)"
 listen_port="$(read_config_value env "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/dev/null || true)"
 upstream_base="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASE 2>/dev/null || true)"
+known_upstreams="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASES 2>/dev/null || true)"
+upstream_aliases="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_ALIASES 2>/dev/null || true)"
 listen_port="${listen_port:-11435}"
+known_upstreams="${known_upstreams:-https://api.hanhegufei.online/v1,https://ai.ailinyu.de/v1,https://token.fourj.space/v1}"
+upstream_aliases="${upstream_aliases:-hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1}"
 guard_base="http://127.0.0.1:$listen_port/v1"
 chain_status="unknown"
 
@@ -923,6 +1076,12 @@ echo "provider=$provider"
 echo "codex_base_url=$current_base"
 echo "guard_base_url=$guard_base"
 echo "guard_upstream=$upstream_base"
+echo "active_upstream=$upstream_base"
+echo "known_upstreams=$known_upstreams"
+echo "upstream_aliases=$upstream_aliases"
+if [[ "$chain_status" != "ok" ]]; then
+  echo "hint=run $INSTALL_ROOT/repair.sh to route Codex through the guard"
+fi
 
 if lsof -nP -iTCP:"$listen_port" -sTCP:LISTEN >/dev/null 2>&1; then
   echo "guard_listening=yes"
@@ -1040,6 +1199,18 @@ is_local_base() {
   [[ "$1" == http://127.0.0.1:* || "$1" == http://localhost:* ]]
 }
 
+append_unique_upstream() {
+  local candidate="$1"
+  [[ -n "$candidate" ]] || return
+  local normalized_candidate
+  normalized_candidate="$(normalize_base_url "$candidate")"
+  local existing
+  for existing in "${upstream_bases[@]}"; do
+    [[ "$(normalize_base_url "$existing")" == "$normalized_candidate" ]] && return
+  done
+  upstream_bases+=("$candidate")
+}
+
 saved_ccswitch_url="$(read_config_value env "$INSTALL_ROOT/config.env" CCSWITCH_URL 2>/dev/null || true)"
 CCSWITCH_URL="${CODEX_SANITIZER_CCSWITCH_URL:-${saved_ccswitch_url:-$DEFAULT_CCSWITCH_URL}}"
 provider="${CODEX_SANITIZER_PROVIDER:-$(read_active_provider "$CONFIG_FILE")}"
@@ -1071,10 +1242,21 @@ fi
   exit 1
 }
 
+upstream_bases=()
+append_unique_upstream "$upstream_base"
+append_unique_upstream "${CODEX_SANITIZER_UPSTREAM_FALLBACK:-}"
+append_unique_upstream "https://api.hanhegufei.online/v1"
+append_unique_upstream "https://ai.ailinyu.de/v1"
+append_unique_upstream "https://token.fourj.space/v1"
+upstream_bases_value="$(IFS=,; printf '%s' "${upstream_bases[*]}")"
+upstream_aliases_value="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_ALIASES 2>/dev/null || echo "hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1")"
+
 cp -p "$CONFIG_FILE" "$BACKUP_DIR/config.toml.repair-$STAMP"
 
 cat > "$INSTALL_ROOT/config.env" <<EOF_CONFIG
 UPSTREAM_BASE=$(printf '%q' "$upstream_base")
+UPSTREAM_BASES=$(printf '%q' "$upstream_bases_value")
+UPSTREAM_ALIASES=$(printf '%q' "$upstream_aliases_value")
 LISTEN_HOST=$listen_host
 LISTEN_PORT=$listen_port
 NO_PROXY=$(printf '%q' "$no_proxy_value")
@@ -1126,6 +1308,266 @@ echo "Upstream: $upstream_base"
 echo "Local base_url: http://127.0.0.1:$listen_port/v1"
 SH_REPAIR
 
+cat > "$INSTALL_ROOT/switch-upstream.sh" <<'SH_SWITCH'
+#!/bin/zsh
+set -euo pipefail
+
+LABEL="dev.codex-imagegen-guard.agent"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+INSTALL_ROOT="$CODEX_HOME/imagegen-guard"
+CONFIG_ENV="$INSTALL_ROOT/config.env"
+CONFIG_FILE="$CODEX_HOME/config.toml"
+
+DEFAULT_UPSTREAMS="https://api.hanhegufei.online/v1,https://ai.ailinyu.de/v1,https://token.fourj.space/v1"
+DEFAULT_ALIASES="hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage:
+  switch-upstream.sh status
+  switch-upstream.sh hanhe
+  switch-upstream.sh ailinyu
+  switch-upstream.sh fourj
+  switch-upstream.sh custom https://example.com[/v1]
+EOF_USAGE
+}
+
+read_env_key() {
+  python3 - "$1" "$2" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+target = sys.argv[2]
+if not path.exists():
+    raise SystemExit(1)
+
+for line in path.read_text().splitlines():
+    if line.startswith(f"{target}="):
+        try:
+            parsed = shlex.split(line.split("=", 1)[1], posix=True)
+            print(parsed[0] if parsed else "")
+        except ValueError:
+            print(line.split("=", 1)[1].strip("'\""))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+normalize_base_url() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+raw = sys.argv[1].strip().rstrip("/")
+if not raw:
+    raise SystemExit(1)
+parsed = urllib.parse.urlparse(raw)
+if not parsed.scheme or not parsed.netloc:
+    raise SystemExit(f"invalid URL: {raw}")
+host = parsed.hostname or ""
+if host == "localhost":
+    host = "127.0.0.1"
+port = f":{parsed.port}" if parsed.port else ""
+path = (parsed.path or "").rstrip("/")
+if not path:
+    path = "/v1"
+elif path != "/v1" and not path.endswith("/v1"):
+    path = f"{path}/v1"
+print(urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", "")))
+PY
+}
+
+unique_list() {
+  python3 - "$@" <<'PY'
+import sys
+import urllib.parse
+
+def normalize(raw: str) -> str:
+    parsed = urllib.parse.urlparse(raw.strip().rstrip("/"))
+    host = parsed.hostname or ""
+    if host == "localhost":
+        host = "127.0.0.1"
+    port = f":{parsed.port}" if parsed.port else ""
+    path = (parsed.path or "").rstrip("/")
+    return urllib.parse.urlunparse((parsed.scheme, f"{host}{port}", path, "", "", ""))
+
+items = []
+seen = set()
+for value in sys.argv[1:]:
+    for part in value.split(","):
+        item = part.strip().rstrip("/")
+        if not item:
+            continue
+        key = normalize(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+print(",".join(items))
+PY
+}
+
+read_codex_base_url() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+text = path.read_text()
+provider = "Codex"
+for line in text.splitlines():
+    match = re.match(r'\s*model_provider\s*=\s*"([^"]+)"', line)
+    if match:
+        provider = match.group(1)
+        break
+
+in_provider = False
+provider_header = f"[model_providers.{provider}]"
+for line in text.splitlines():
+    stripped = line.strip()
+    if stripped == provider_header:
+        in_provider = True
+        continue
+    if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+        break
+    if in_provider:
+        match = re.match(r'base_url\s*=\s*"([^"]+)"', stripped)
+        if match:
+            print(match.group(1))
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+write_env() {
+  local active="$1"
+  local bases="$2"
+  local alias_map="$3"
+  python3 - "$CONFIG_ENV" "$active" "$bases" "$alias_map" <<'PY'
+import shlex
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+updates = {
+    "UPSTREAM_BASE": sys.argv[2],
+    "UPSTREAM_BASES": sys.argv[3],
+    "UPSTREAM_ALIASES": sys.argv[4],
+}
+path.parent.mkdir(parents=True, exist_ok=True)
+lines = path.read_text().splitlines() if path.exists() else []
+out = []
+seen = set()
+for line in lines:
+    key = line.split("=", 1)[0] if "=" in line else ""
+    if key in updates:
+        out.append(f"{key}={shlex.quote(updates[key])}")
+        seen.add(key)
+    else:
+        out.append(line)
+for key, value in updates.items():
+    if key not in seen:
+        out.append(f"{key}={shlex.quote(value)}")
+path.write_text("\n".join(out) + "\n")
+path.chmod(0o600)
+PY
+}
+
+restart_agent() {
+  if command -v launchctl >/dev/null 2>&1 && launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  fi
+}
+
+status() {
+  local listen_port active bases alias_map current_base guard_base chain_status
+  listen_port="$(read_env_key "$CONFIG_ENV" LISTEN_PORT 2>/dev/null || echo 11435)"
+  active="$(read_env_key "$CONFIG_ENV" UPSTREAM_BASE 2>/dev/null || true)"
+  bases="$(read_env_key "$CONFIG_ENV" UPSTREAM_BASES 2>/dev/null || echo "$DEFAULT_UPSTREAMS")"
+  alias_map="$(read_env_key "$CONFIG_ENV" UPSTREAM_ALIASES 2>/dev/null || echo "$DEFAULT_ALIASES")"
+  current_base="$(read_codex_base_url "$CONFIG_FILE" 2>/dev/null || true)"
+  guard_base="http://127.0.0.1:$listen_port/v1"
+  if [[ "$(normalize_base_url "$current_base" 2>/dev/null || true)" == "$(normalize_base_url "$guard_base")" ]]; then
+    chain_status="ok"
+  elif [[ "$current_base" == http://127.0.0.1:* || "$current_base" == http://localhost:* ]]; then
+    chain_status="bypassed-local"
+  else
+    chain_status="bypassed-remote"
+  fi
+
+  echo "status=$chain_status"
+  echo "active_upstream=$active"
+  echo "known_upstreams=$bases"
+  echo "upstream_aliases=$alias_map"
+  echo "codex_base_url=$current_base"
+  echo "guard_base_url=$guard_base"
+  if [[ "$chain_status" != "ok" ]]; then
+    echo "hint=run $INSTALL_ROOT/repair.sh to route Codex through the guard"
+  fi
+}
+
+resolve_alias() {
+  local name="$1"
+  local alias_map
+  alias_map="$(read_env_key "$CONFIG_ENV" UPSTREAM_ALIASES 2>/dev/null || echo "$DEFAULT_ALIASES")"
+  python3 - "$name" "$alias_map" <<'PY'
+import sys
+target = sys.argv[1]
+for item in sys.argv[2].split(","):
+    if "=" not in item:
+        continue
+    key, value = item.split("=", 1)
+    if key == target:
+        print(value)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+[[ $# -ge 1 ]] || {
+  usage >&2
+  exit 2
+}
+
+case "$1" in
+  status)
+    status
+    ;;
+  custom)
+    [[ $# -eq 2 ]] || {
+      usage >&2
+      exit 2
+    }
+    target="$(normalize_base_url "$2")"
+    bases="$(unique_list "$target" "$(read_env_key "$CONFIG_ENV" UPSTREAM_BASES 2>/dev/null || echo "$DEFAULT_UPSTREAMS")")"
+    alias_map="$(read_env_key "$CONFIG_ENV" UPSTREAM_ALIASES 2>/dev/null || echo "$DEFAULT_ALIASES")"
+    write_env "$target" "$bases" "$alias_map"
+    restart_agent
+    echo "active_upstream=$target"
+    ;;
+  *)
+    target="$(resolve_alias "$1" 2>/dev/null || true)"
+    [[ -n "$target" ]] || {
+      echo "ERROR: unknown upstream alias: $1" >&2
+      usage >&2
+      exit 2
+    }
+    target="$(normalize_base_url "$target")"
+    bases="$(unique_list "$target" "$(read_env_key "$CONFIG_ENV" UPSTREAM_BASES 2>/dev/null || echo "$DEFAULT_UPSTREAMS")")"
+    alias_map="$(read_env_key "$CONFIG_ENV" UPSTREAM_ALIASES 2>/dev/null || echo "$DEFAULT_ALIASES")"
+    write_env "$target" "$bases" "$alias_map"
+    restart_agent
+    echo "active_upstream=$target"
+    ;;
+esac
+
+SH_SWITCH
+
 cat > "$INSTALL_ROOT/README.md" <<EOF_README
 # Codex Imagegen Guard
 
@@ -1174,7 +1616,7 @@ tail -30 "$INSTALL_ROOT/logs/proxy.log"
 卸载会恢复最近一次安装前的 \`config.toml\` 备份，并停止 LaunchAgent。
 EOF_README
 
-chmod 700 "$INSTALL_ROOT/codex_imagegen_guard.py" "$INSTALL_ROOT/uninstall.sh" "$INSTALL_ROOT/doctor.sh" "$INSTALL_ROOT/repair.sh"
+chmod 700 "$INSTALL_ROOT/codex_imagegen_guard.py" "$INSTALL_ROOT/uninstall.sh" "$INSTALL_ROOT/doctor.sh" "$INSTALL_ROOT/repair.sh" "$INSTALL_ROOT/switch-upstream.sh"
 
 python3 - "$CONFIG_FILE" "$listen_port" "$provider_name" <<'PY_EDIT_CONFIG'
 import re
