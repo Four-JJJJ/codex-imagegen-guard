@@ -274,13 +274,17 @@ fi
 
 upstream_bases=()
 append_unique_upstream "$upstream_base"
+append_unique_upstream "$(read_env_key "$INSTALL_ROOT/config.env" UPSTREAM_BASES 2>/dev/null || true)"
 append_unique_upstream "${CODEX_SANITIZER_UPSTREAM_FALLBACK:-}"
 append_unique_upstream "https://api.hanhegufei.online/v1"
 append_unique_upstream "https://ai.ailinyu.de/v1"
 append_unique_upstream "https://token.fourj.space/v1"
 upstream_bases_value="$(IFS=,; printf '%s' "${upstream_bases[*]}")"
-upstream_aliases_value="hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1"
+upstream_aliases_value="$(read_env_key "$INSTALL_ROOT/config.env" UPSTREAM_ALIASES 2>/dev/null || echo "hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1")"
 upstream_port="$(url_port "$upstream_base")"
+auto_discover_value="${CODEX_SANITIZER_AUTO_DISCOVER_UPSTREAM:-$(read_env_key "$INSTALL_ROOT/config.env" AUTO_DISCOVER_UPSTREAM 2>/dev/null || echo 1)}"
+discovery_interval_value="${CODEX_SANITIZER_DISCOVERY_INTERVAL:-$(read_env_key "$INSTALL_ROOT/config.env" DISCOVERY_INTERVAL 2>/dev/null || echo 5)}"
+discovery_debounce_value="${CODEX_SANITIZER_DISCOVERY_DEBOUNCE:-$(read_env_key "$INSTALL_ROOT/config.env" DISCOVERY_DEBOUNCE 2>/dev/null || echo 1)}"
 
 stop_existing_agents
 
@@ -353,6 +357,9 @@ LISTEN_PORT=$listen_port
 NO_PROXY=$(printf '%q' "$no_proxy_value")
 UPSTREAM_PROXY_MODE=$upstream_proxy_mode
 CCSWITCH_URL=$(printf '%q' "$ccswitch_base")
+AUTO_DISCOVER_UPSTREAM=$auto_discover_value
+DISCOVERY_INTERVAL=$discovery_interval_value
+DISCOVERY_DEBOUNCE=$discovery_debounce_value
 EOF_CONFIG
 chmod 600 "$INSTALL_ROOT/config.env"
 
@@ -367,6 +374,7 @@ import socket
 import ssl
 import sys
 import threading
+import time
 import http.client
 import urllib.error
 import urllib.parse
@@ -376,8 +384,10 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path.home() / ".codex" / "imagegen-guard"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+ROOT = CODEX_HOME / "imagegen-guard"
 CONFIG_PATH = ROOT / "config.env"
+CODEX_CONFIG_PATH = CODEX_HOME / "config.toml"
 
 
 def load_config() -> dict[str, str]:
@@ -409,6 +419,9 @@ UPSTREAM_PROXY_MODE = os.environ.get("CODEX_SANITIZER_UPSTREAM_PROXY_MODE", CONF
 URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({})) if UPSTREAM_PROXY_MODE == "direct" else urllib.request.build_opener()
 STREAM_CHUNK_SIZE = int(os.environ.get("CODEX_SANITIZER_STREAM_CHUNK_SIZE", CONFIG.get("STREAM_CHUNK_SIZE", "8192")))
 UPSTREAM_RETRY_STATUSES = {int(item.strip()) for item in os.environ.get("CODEX_SANITIZER_RETRY_STATUSES", CONFIG.get("RETRY_STATUSES", "401")).split(",") if item.strip()}
+AUTO_DISCOVER_UPSTREAM = os.environ.get("CODEX_SANITIZER_AUTO_DISCOVER_UPSTREAM", CONFIG.get("AUTO_DISCOVER_UPSTREAM", "1")).lower() not in {"0", "false", "no", "off"}
+DISCOVERY_INTERVAL = float(os.environ.get("CODEX_SANITIZER_DISCOVERY_INTERVAL", CONFIG.get("DISCOVERY_INTERVAL", "5")))
+DISCOVERY_DEBOUNCE = float(os.environ.get("CODEX_SANITIZER_DISCOVERY_DEBOUNCE", CONFIG.get("DISCOVERY_DEBOUNCE", "1")))
 
 IMAGE_TOOL_NAMES = {"image_generation"}
 USER_TEXT_KEYS = {"input", "text", "input_text", "content", "message", "prompt"}
@@ -483,29 +496,139 @@ def ordered_upstream_bases() -> list[str]:
 
 def persist_current_upstream(base_url: str) -> None:
     ROOT.mkdir(parents=True, exist_ok=True)
+    with UPSTREAM_LOCK:
+        bases_value = ",".join(UPSTREAM_BASES)
+    updates = {
+        "UPSTREAM_BASE": base_url,
+        "UPSTREAM_BASES": bases_value,
+    }
     lines = CONFIG_PATH.read_text().splitlines() if CONFIG_PATH.exists() else []
     out: list[str] = []
-    changed = False
+    seen: set[str] = set()
     for line in lines:
-        if line.startswith("UPSTREAM_BASE="):
-            out.append(f"UPSTREAM_BASE={shlex.quote(base_url)}")
-            changed = True
+        key = line.split("=", 1)[0] if "=" in line else ""
+        if key in updates:
+            out.append(f"{key}={shlex.quote(updates[key])}")
+            seen.add(key)
         else:
             out.append(line)
-    if not changed:
-        out.append(f"UPSTREAM_BASE={shlex.quote(base_url)}")
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={shlex.quote(value)}")
     CONFIG_PATH.write_text("\n".join(out) + "\n")
     CONFIG_PATH.chmod(0o600)
 
 
 def set_current_upstream(base_url: str) -> None:
-    global UPSTREAM_BASE
+    global UPSTREAM_BASE, UPSTREAM_BASES
+    normalized = normalize_base_url(base_url)
+    changed = False
     with UPSTREAM_LOCK:
-        if normalize_base_url(base_url) == normalize_base_url(UPSTREAM_BASE):
-            return
-        UPSTREAM_BASE = base_url
+        if normalize_base_url(UPSTREAM_BASE) != normalized:
+            UPSTREAM_BASE = base_url
+            changed = True
+        UPSTREAM_BASES = split_upstream_bases(",".join([base_url, *UPSTREAM_BASES]))
     persist_current_upstream(base_url)
-    logging.info("switched active upstream to %s", base_url)
+    if changed:
+        logging.info("switched active upstream to %s", base_url)
+
+
+def guard_base_url() -> str:
+    return f"http://127.0.0.1:{LISTEN_PORT}/v1"
+
+
+def read_active_provider() -> str:
+    if not CODEX_CONFIG_PATH.exists():
+        return "Codex"
+    for line in CODEX_CONFIG_PATH.read_text().splitlines():
+        match = re.match(r'\s*model_provider\s*=\s*"([^"]+)"', line)
+        if match:
+            return match.group(1)
+    return "Codex"
+
+
+def read_codex_base_url(provider: str) -> str:
+    if not CODEX_CONFIG_PATH.exists():
+        return ""
+    in_provider = False
+    provider_header = f"[model_providers.{provider}]"
+    for line in CODEX_CONFIG_PATH.read_text().splitlines():
+        stripped = line.strip()
+        if stripped == provider_header:
+            in_provider = True
+            continue
+        if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+            break
+        if in_provider:
+            match = re.match(r'base_url\s*=\s*"([^"]+)"', stripped)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def write_codex_base_url(provider: str, base_url: str) -> None:
+    lines = CODEX_CONFIG_PATH.read_text().splitlines()
+    out: list[str] = []
+    in_provider = False
+    changed = False
+    provider_header = f"[model_providers.{provider}]"
+    for line in lines:
+        stripped = line.strip()
+        if stripped == provider_header:
+            in_provider = True
+            out.append(line)
+            continue
+        if in_provider and stripped.startswith("[") and stripped.endswith("]"):
+            in_provider = False
+        if in_provider and re.match(r'\s*base_url\s*=', line):
+            prefix = line[: len(line) - len(line.lstrip())]
+            out.append(f'{prefix}base_url = "{base_url}"')
+            changed = True
+        else:
+            out.append(line)
+    if not changed:
+        raise RuntimeError(f"failed to update [model_providers.{provider}] base_url")
+    CODEX_CONFIG_PATH.write_text("\n".join(out) + "\n")
+
+
+def is_valid_discovered_upstream(base_url: str) -> bool:
+    if not base_url:
+        return False
+    parsed = urllib.parse.urlparse(base_url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return False
+    return normalize_base_url(base_url) != normalize_base_url(guard_base_url())
+
+
+def detect_and_repair_codex_config() -> bool:
+    provider = read_active_provider()
+    current_base = read_codex_base_url(provider)
+    if not is_valid_discovered_upstream(current_base):
+        return False
+    set_current_upstream(current_base.rstrip("/"))
+    write_codex_base_url(provider, guard_base_url())
+    logging.info("auto-discovered upstream %s and restored Codex base_url to %s", current_base, guard_base_url())
+    return True
+
+
+def config_discovery_loop() -> None:
+    last_mtime = CODEX_CONFIG_PATH.stat().st_mtime if CODEX_CONFIG_PATH.exists() else 0.0
+    while True:
+        time.sleep(max(DISCOVERY_INTERVAL, 1.0))
+        try:
+            current_mtime = CODEX_CONFIG_PATH.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if current_mtime == last_mtime:
+            continue
+        last_mtime = current_mtime
+        if DISCOVERY_DEBOUNCE > 0:
+            time.sleep(DISCOVERY_DEBOUNCE)
+        try:
+            if detect_and_repair_codex_config() and CODEX_CONFIG_PATH.exists():
+                last_mtime = CODEX_CONFIG_PATH.stat().st_mtime
+        except Exception as error:
+            logging.warning("auto upstream discovery failed: %s", short_error(error))
 
 
 def collect_text(value: Any, chunks: list[str]) -> None:
@@ -878,10 +1001,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 if not self.safe_write(data):
                     return True
 
-    def upstream_headers(self, content_length: int) -> dict[str, str]:
+    def upstream_headers(self, content_length: int, upstream_base: str) -> dict[str, str]:
         blocked = {"host", "content-length", "connection", "proxy-connection", "accept-encoding"}
         headers = {key: value for key, value in self.headers.items() if key.lower() not in blocked}
-        headers["Host"] = urllib.parse.urlparse(UPSTREAM_BASE).netloc
+        headers["Host"] = urllib.parse.urlparse(upstream_base).netloc
         if self.command not in {"GET", "HEAD"}:
             headers["Content-Length"] = str(content_length)
         return headers
@@ -898,6 +1021,12 @@ def main() -> int:
     if not UPSTREAM_BASE:
         logging.error("UPSTREAM_BASE is empty")
         return 2
+    if AUTO_DISCOVER_UPSTREAM:
+        try:
+            detect_and_repair_codex_config()
+        except Exception as error:
+            logging.warning("initial auto upstream discovery failed: %s", short_error(error))
+        threading.Thread(target=config_discovery_loop, name="config-discovery", daemon=True).start()
     server = ReusableThreadingHTTPServer((LISTEN_HOST, LISTEN_PORT), ProxyHandler)
     logging.info("Codex imagegen guard listening on http://%s:%s -> %s", LISTEN_HOST, LISTEN_PORT, UPSTREAM_BASE)
     try:
@@ -1055,9 +1184,15 @@ listen_port="$(read_config_value env "$INSTALL_ROOT/config.env" LISTEN_PORT 2>/d
 upstream_base="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASE 2>/dev/null || true)"
 known_upstreams="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASES 2>/dev/null || true)"
 upstream_aliases="$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_ALIASES 2>/dev/null || true)"
+auto_discover="$(read_config_value env "$INSTALL_ROOT/config.env" AUTO_DISCOVER_UPSTREAM 2>/dev/null || true)"
+discovery_interval="$(read_config_value env "$INSTALL_ROOT/config.env" DISCOVERY_INTERVAL 2>/dev/null || true)"
+discovery_debounce="$(read_config_value env "$INSTALL_ROOT/config.env" DISCOVERY_DEBOUNCE 2>/dev/null || true)"
 listen_port="${listen_port:-11435}"
 known_upstreams="${known_upstreams:-https://api.hanhegufei.online/v1,https://ai.ailinyu.de/v1,https://token.fourj.space/v1}"
 upstream_aliases="${upstream_aliases:-hanhe=https://api.hanhegufei.online/v1,ailinyu=https://ai.ailinyu.de/v1,fourj=https://token.fourj.space/v1}"
+auto_discover="${auto_discover:-1}"
+discovery_interval="${discovery_interval:-5}"
+discovery_debounce="${discovery_debounce:-1}"
 guard_base="http://127.0.0.1:$listen_port/v1"
 chain_status="unknown"
 
@@ -1079,6 +1214,9 @@ echo "guard_upstream=$upstream_base"
 echo "active_upstream=$upstream_base"
 echo "known_upstreams=$known_upstreams"
 echo "upstream_aliases=$upstream_aliases"
+echo "auto_discover_upstream=$auto_discover"
+echo "discovery_interval=$discovery_interval"
+echo "discovery_debounce=$discovery_debounce"
 if [[ "$chain_status" != "ok" ]]; then
   echo "hint=run $INSTALL_ROOT/repair.sh to route Codex through the guard"
 fi
@@ -1201,7 +1339,14 @@ is_local_base() {
 
 append_unique_upstream() {
   local candidate="$1"
-  [[ -n "$candidate" ]] || return
+  [[ -n "$candidate" ]] || return 0
+  if [[ "$candidate" == *,* ]]; then
+    local part
+    for part in ${(s:,:)candidate}; do
+      append_unique_upstream "$part"
+    done
+    return 0
+  fi
   local normalized_candidate
   normalized_candidate="$(normalize_base_url "$candidate")"
   local existing
@@ -1242,8 +1387,12 @@ fi
   exit 1
 }
 
+auto_discover_value="${CODEX_SANITIZER_AUTO_DISCOVER_UPSTREAM:-$(read_config_value env "$INSTALL_ROOT/config.env" AUTO_DISCOVER_UPSTREAM 2>/dev/null || echo 1)}"
+discovery_interval_value="${CODEX_SANITIZER_DISCOVERY_INTERVAL:-$(read_config_value env "$INSTALL_ROOT/config.env" DISCOVERY_INTERVAL 2>/dev/null || echo 5)}"
+discovery_debounce_value="${CODEX_SANITIZER_DISCOVERY_DEBOUNCE:-$(read_config_value env "$INSTALL_ROOT/config.env" DISCOVERY_DEBOUNCE 2>/dev/null || echo 1)}"
 upstream_bases=()
 append_unique_upstream "$upstream_base"
+append_unique_upstream "$(read_config_value env "$INSTALL_ROOT/config.env" UPSTREAM_BASES 2>/dev/null || true)"
 append_unique_upstream "${CODEX_SANITIZER_UPSTREAM_FALLBACK:-}"
 append_unique_upstream "https://api.hanhegufei.online/v1"
 append_unique_upstream "https://ai.ailinyu.de/v1"
@@ -1262,6 +1411,9 @@ LISTEN_PORT=$listen_port
 NO_PROXY=$(printf '%q' "$no_proxy_value")
 UPSTREAM_PROXY_MODE=$proxy_mode
 CCSWITCH_URL=$(printf '%q' "$CCSWITCH_URL")
+AUTO_DISCOVER_UPSTREAM=$auto_discover_value
+DISCOVERY_INTERVAL=$discovery_interval_value
+DISCOVERY_DEBOUNCE=$discovery_debounce_value
 EOF_CONFIG
 chmod 600 "$INSTALL_ROOT/config.env"
 

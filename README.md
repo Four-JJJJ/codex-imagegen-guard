@@ -124,6 +124,9 @@ zsh install.sh
 - `CODEX_SANITIZER_NO_PROXY`：覆盖本服务使用的 `NO_PROXY`。
 - `CODEX_SANITIZER_UPSTREAM_PROXY_MODE`：`system` 或 `direct`。默认 `system`，表示上游继续走系统代理。
 - `CODEX_SANITIZER_RETRY_STATUSES`：触发备用上游重试的 HTTP 状态码，默认 `401`。
+- `CODEX_SANITIZER_AUTO_DISCOVER_UPSTREAM`：是否自动识别被其它工具写入的 Codex `base_url`，默认 `1`。识别到新上游后会保存为 guard 上游，并把 Codex 入口恢复为本机 guard。
+- `CODEX_SANITIZER_DISCOVERY_INTERVAL`：自动识别轮询间隔，默认 `5` 秒；只检查 `config.toml` 的修改时间，修改后才读取文件。
+- `CODEX_SANITIZER_DISCOVERY_DEBOUNCE`：检测到配置变化后的等待时间，默认 `1` 秒，用来避开 cc-switch 仍在写文件的瞬间。
 
 ## 卸载
 
