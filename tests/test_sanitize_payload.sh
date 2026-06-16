@@ -74,4 +74,64 @@ negative_payload = {
 sanitized, changed = guard.sanitize_payload(copy.deepcopy(negative_payload))
 assert changed is True
 assert "tools" not in sanitized
+
+strict_explicit_payload = {
+    "input": [{"role": "user", "content": "帮我生成图片，一张极简海报"}],
+    "tools": [{"type": "image_generation"}],
+    "tool_choice": {"type": "image_generation"},
+}
+kept, changed = guard.sanitize_payload(copy.deepcopy(strict_explicit_payload))
+assert changed is False
+assert kept == strict_explicit_payload
+
+ui_layout_payload = {
+    "input": [{"role": "user", "content": "发送的首条对话距离窗口上部 16px，生成图片的模块距离对话 40px 向下排列"}],
+    "tools": [{"type": "image_generation"}, {"type": "web_search_preview"}],
+    "tool_choice": {"type": "image_generation"},
+}
+sanitized, changed = guard.sanitize_payload(copy.deepcopy(ui_layout_payload))
+assert changed is True
+assert sanitized["tools"] == [{"type": "web_search_preview"}]
+assert "tool_choice" not in sanitized
+
+button_payload = {
+    "input": [{"role": "user", "content": "图片生成按钮为什么没对齐"}],
+    "tools": [{"type": "image_generation"}],
+}
+sanitized, changed = guard.sanitize_payload(copy.deepcopy(button_payload))
+assert changed is True
+assert "tools" not in sanitized
+
+error_payload = {
+    "input": [{"role": "user", "content": "这个生图功能为什么报 403"}],
+    "tools": [{"type": "image_generation"}],
+}
+sanitized, changed = guard.sanitize_payload(copy.deepcopy(error_payload))
+assert changed is True
+assert "tools" not in sanitized
+
+not_request_payload = {
+    "input": [{"role": "user", "content": "不是要生成图片，我是在描述设置页"}],
+    "tools": [{"type": "image_generation"}],
+}
+sanitized, changed = guard.sanitize_payload(copy.deepcopy(not_request_payload))
+assert changed is True
+assert "tools" not in sanitized
+
+english_descriptive_payload = {
+    "input": [{"role": "user", "content": "the image generation panel should stay 40px below the message"}],
+    "tools": [{"type": "image_generation"}],
+}
+sanitized, changed = guard.sanitize_payload(copy.deepcopy(english_descriptive_payload))
+assert changed is True
+assert "tools" not in sanitized
+
+english_explicit_payload = {
+    "input": [{"role": "user", "content": "please generate an image of a product poster"}],
+    "tools": [{"type": "image_generation"}],
+    "tool_choice": {"type": "image_generation"},
+}
+kept, changed = guard.sanitize_payload(copy.deepcopy(english_explicit_payload))
+assert changed is False
+assert kept == english_explicit_payload
 PY

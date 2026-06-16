@@ -428,13 +428,13 @@ USER_TEXT_KEYS = {"input", "text", "input_text", "content", "message", "prompt"}
 USER_ROLE_KEYS = {"user", "human"}
 EXPLICIT_IMAGE_PATTERNS = [
     r"\bimage_generation\b",
-    r"\bgenerate\s+(an?\s+)?image\b",
-    r"\bcreate\s+(an?\s+)?image\b",
-    r"\bdraw\s+(an?\s+)?image\b",
-    r"\bmake\s+(an?\s+)?picture\b",
-    r"生成.{0,8}(图片|图像|图|海报|插画|照片)",
-    r"(图片|图像|插画|海报|照片).{0,8}(生成|生图|画|绘制)",
-    r"生图",
+    r"\b(?:please|pls|can you|could you|help me|make|generate|create|draw)\b.{0,24}\b(an?\s+)?(image|picture|poster|illustration|photo)\b",
+    r"\bdraw\s+me\b.{0,24}\b(image|picture|poster|illustration|photo)\b",
+    r"\b(i need|i want)\b.{0,24}\b(an?\s+)?(image|picture|poster|illustration|photo)\b",
+    r"(请|帮我|麻烦|给我|替我).{0,12}(生成|做|画|绘制).{0,12}(一张|一个|一幅)?(图片|图像|图|海报|插画|照片)",
+    r"(生成|做|画|绘制).{0,8}(一张|一个|一幅).{0,8}(图片|图像|图|海报|插画|照片)",
+    r"(我想|我要|我需要).{0,8}(生成|做|画|绘制).{0,12}(图片|图像|图|海报|插画|照片)",
+    r"(帮我|请).{0,12}生图",
     r"画一张",
 ]
 NEGATIVE_IMAGE_PATTERNS = [
@@ -442,6 +442,10 @@ NEGATIVE_IMAGE_PATTERNS = [
     r"(不要|不用|不需要|无需|别|禁止).{0,8}(image_generation|generate\s+(an?\s+)?image|create\s+(an?\s+)?image|draw\s+(an?\s+)?image)",
     r"\b(do not|don't|dont|no need to|without)\s+(use\s+)?(image_generation|generate\s+(an?\s+)?image|create\s+(an?\s+)?image|draw\s+(an?\s+)?image)",
     r"\bno\s+image\s+generation\b",
+    r"(不是|并不是|不是在|并非).{0,8}(要|想|准备)?(.{0,6})?(生成.{0,4}(图片|图像|图)|生图|画图|画一张|绘制)",
+    r"(只是|是在|用来|正在).{0,12}(描述|讨论|调整|排查|查看|说明).{0,16}(图片|图像|生图|image generation)",
+    r"\b(image generation|image_generator)\b.{0,16}\b(module|panel|button|tool|feature|layout|error|bug)\b",
+    r"\b(module|panel|button|tool|feature|layout|error|bug)\b.{0,16}\b(image generation|image_generator)\b",
 ]
 
 
